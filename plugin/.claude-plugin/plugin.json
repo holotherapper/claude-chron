@@ -1,0 +1,8 @@
+{
+  "name": "claude-chron",
+  "version": "0.1.0",
+  "description": "Local RAG search for Claude Code session history — indexes transcripts, searches semantically",
+  "author": {
+    "name": "holotherapper"
+  }
+}

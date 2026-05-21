@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@a54c7afa936fefeb4456b2dd8068152669aa8203 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy (no default features)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - name: Test (no default features)
+        run: cargo test --no-default-features
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test (default features)
+        run: cargo test
+      - name: Build (default features)
+        run: cargo build --release
+
+      - name: Deny (licenses)
+        run: |
+          cargo install --locked cargo-deny@0.19.5
+          cargo deny check licenses bans sources
+
+      - name: Deny (advisories)
+        run: cargo deny check advisories
+        continue-on-error: true
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$cargo_version" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Cargo.toml version ($cargo_version) does not match tag (${{ steps.version.outputs.version }})"
+            exit 1
+          fi
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          # Lines between this version's header and the next version header.
+          changelog=$(awk "/^## \[${version}\]/{found=1; next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md)
+          echo "$changelog" > /tmp/release_notes.md
+          echo "notes_file=/tmp/release_notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists, skipping creation"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file "${{ steps.changelog.outputs.notes_file }}"
+          fi
+
+      # The tap-publishing steps below only run when the repository is
+      # public. They write to the public holotherapper/homebrew-tap, and a
+      # tap formula pointing at a private archive URL would be both broken
+      # for users and a confusing supply-chain event — so a tag pushed
+      # while the repository is still private must never reach the tap.
+      - name: Compute tarball SHA256
+        id: sha
+        if: ${{ !github.event.repository.private }}
+        run: |
+          curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" -o /tmp/source.tar.gz
+          sha=$(shasum -a 256 /tmp/source.tar.gz | awk '{print $1}')
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        if: ${{ !github.event.repository.private }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          sha="${{ steps.sha.outputs.sha256 }}"
+          repo="holotherapper/homebrew-tap"
+          file="Formula/cchron.rb"
+
+          current_sha=$(gh api "repos/${repo}/contents/${file}" -q .sha)
+          content=$(gh api "repos/${repo}/contents/${file}" -q .content | base64 -d)
+
+          updated=$(echo "$content" \
+            | sed "s|archive/refs/tags/v[0-9.]*\.tar\.gz|archive/refs/tags/v${version}.tar.gz|" \
+            | sed "s|sha256 \"[a-f0-9]*\"|sha256 \"${sha}\"|")
+
+          gh api "repos/${repo}/contents/${file}" -X PUT \
+            -f message="🔖 claude-chron ${version}" \
+            -f content="$(echo "$updated" | base64)" \
+            -f sha="$current_sha" \
+            -q .content.html_url

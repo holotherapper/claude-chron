@@ -1,0 +1,56 @@
+[package]
+name = "claude-chron"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Local RAG search for Claude Code session history"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/holotherapper/claude-chron"
+readme = "README.md"
+keywords = ["claude-code", "rag", "search", "mcp", "session-history"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "cchron"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+hex = "0.4"
+mcp-server = "0.1"
+mcp-spec = "0.1"
+regex = "1"
+rusqlite = { version = "0.39", features = ["bundled", "vtab"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlite-vec = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util"] }
+toml = "0.8"
+
+# ONNX embedding (default-enabled)
+hf-hub = { version = "0.4", optional = true }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "copy-dylibs"], optional = true }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+
+[features]
+default = ["onnx"]
+onnx = ["dep:hf-hub", "dep:ort", "dep:tokenizers"]
+
+[lints.rust]
+unsafe_code = "allow"
+future_incompatible = { level = "warn", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = "deny"
+redundant_clone = "deny"
+needless_collect = "deny"
+large_enum_variant = "deny"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,26 @@
+{
+  "name": "claude-chron",
+  "owner": {
+    "name": "holotherapper"
+  },
+  "metadata": {
+    "description": "Local RAG search for Claude Code session history",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "claude-chron",
+      "description": "Local RAG search for Claude Code session history — indexes transcripts, searches semantically",
+      "version": "0.1.0",
+      "source": "./plugin",
+      "category": "productivity",
+      "author": {
+        "name": "holotherapper"
+      },
+      "homepage": "https://github.com/holotherapper/claude-chron",
+      "repository": "https://github.com/holotherapper/claude-chron",
+      "license": "MIT OR Apache-2.0",
+      "keywords": ["memory", "search", "rag", "session-history", "sqlite"]
+    }
+  ]
+}
