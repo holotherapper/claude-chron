@@ -238,6 +238,63 @@ impl Storage {
         Ok(())
     }
 
+    /// Applies an incremental session update in a single transaction: removes
+    /// stale chunks, inserts only the new chunks (the only ones that needed
+    /// embedding), refreshes the stored turns, and upserts the session row.
+    /// Chunks whose `chunk_uid` is unchanged keep their rows, embeddings, and
+    /// FTS entries untouched.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] when any statement fails. On error, the entire
+    /// transaction is rolled back and existing data is preserved.
+    pub fn update_session_incremental(
+        &mut self,
+        session: &NewSession,
+        index_sig: &str,
+        turns: &[Turn],
+        new_chunks: &[&Chunk],
+        new_embeddings: &[Vec<f32>],
+        stale_chunk_ids: &[i64],
+    ) -> StorageResult<()> {
+        if new_chunks.len() != new_embeddings.len() {
+            return Err(StorageError::MismatchedEmbeddings {
+                chunks: new_chunks.len(),
+                embeddings: new_embeddings.len(),
+            });
+        }
+        let tx = self.conn.transaction()?;
+        delete_chunk_rows(&tx, stale_chunk_ids)?;
+        upsert_session_row(&tx, session, index_sig)?;
+        tx.execute(
+            "DELETE FROM turns WHERE session_id = ?1",
+            params![session.session_id],
+        )?;
+        insert_turn_rows(&tx, &session.session_id, turns)?;
+        insert_chunk_rows(
+            &tx,
+            new_chunks.iter().copied(),
+            new_embeddings,
+            self.embedding_dimension,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Returns the `chunk_uid` → rowid map for a session's stored chunks.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] when the query fails.
+    pub fn chunk_uids_for_session(&self, session_id: &str) -> StorageResult<HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT chunk_uid, id FROM chunks WHERE session_id = ?1")?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(StorageError::from)
+    }
+
     /// Returns whether a session with the given transcript hash and mtime exists.
     ///
     /// # Errors
@@ -704,23 +761,55 @@ fn delete_session_rows(conn: &Connection, session_id: &str) -> StorageResult<()>
         stmt.query_map(params![session_id], |row| row.get::<_, i64>(0))?
             .collect::<Result<Vec<_>, _>>()?
     };
-    {
-        let mut vec_stmt = conn.prepare("DELETE FROM chunk_vec WHERE rowid = ?1")?;
-        let mut fts_stmt = conn.prepare("DELETE FROM chunk_fts WHERE rowid = ?1")?;
-        for chunk_id in &chunk_ids {
-            vec_stmt.execute(params![chunk_id])?;
-            fts_stmt.execute(params![chunk_id])?;
-        }
-    }
-    conn.execute(
-        "DELETE FROM chunks WHERE session_id = ?1",
-        params![session_id],
-    )?;
+    delete_chunk_rows(conn, &chunk_ids)?;
     conn.execute(
         "DELETE FROM turns WHERE session_id = ?1",
         params![session_id],
     )?;
     conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+    Ok(())
+}
+
+/// Deletes chunks (and their vector and FTS shadow rows) by rowid.
+fn delete_chunk_rows(conn: &Connection, chunk_ids: &[i64]) -> StorageResult<()> {
+    let mut vec_stmt = conn.prepare("DELETE FROM chunk_vec WHERE rowid = ?1")?;
+    let mut fts_stmt = conn.prepare("DELETE FROM chunk_fts WHERE rowid = ?1")?;
+    let mut chunk_stmt = conn.prepare("DELETE FROM chunks WHERE id = ?1")?;
+    for chunk_id in chunk_ids {
+        vec_stmt.execute(params![chunk_id])?;
+        fts_stmt.execute(params![chunk_id])?;
+        chunk_stmt.execute(params![chunk_id])?;
+    }
+    Ok(())
+}
+
+/// Updates the session row in place, inserting it when absent. A plain
+/// `INSERT OR REPLACE` would delete-and-reinsert the row, and the resulting
+/// `ON DELETE CASCADE` would wipe the session's surviving chunks and turns.
+fn upsert_session_row(
+    conn: &Connection,
+    session: &NewSession,
+    index_sig: &str,
+) -> StorageResult<()> {
+    let updated = conn.execute(
+        "UPDATE sessions
+         SET project_path = ?2, transcript_path = ?3, sha256 = ?4, mtime = ?5,
+             size = ?6, indexed_at = ?7, index_sig = ?8
+         WHERE id = ?1",
+        params![
+            session.session_id,
+            session.project_path,
+            session.transcript_path.to_string_lossy(),
+            session.sha256,
+            session.mtime.to_rfc3339(),
+            u64_to_i64(session.size),
+            Utc::now().to_rfc3339(),
+            index_sig,
+        ],
+    )?;
+    if updated == 0 {
+        insert_session_row(conn, session, index_sig)?;
+    }
     Ok(())
 }
 
@@ -793,9 +882,9 @@ fn redact_tool_summary_json(json: &str) -> String {
     }
 }
 
-fn insert_chunk_rows(
+fn insert_chunk_rows<'a>(
     conn: &Connection,
-    chunks: &[Chunk],
+    chunks: impl IntoIterator<Item = &'a Chunk>,
     embeddings: &[Vec<f32>],
     embedding_dimension: usize,
 ) -> StorageResult<()> {
@@ -809,7 +898,7 @@ fn insert_chunk_rows(
     let mut fts_stmt =
         conn.prepare("INSERT INTO chunk_fts(rowid, chunk_uid, text) VALUES (?1, ?2, ?3)")?;
 
-    for (chunk, embedding) in chunks.iter().zip(embeddings) {
+    for (chunk, embedding) in chunks.into_iter().zip(embeddings) {
         validate_embedding_dimension(embedding, embedding_dimension)?;
         chunk_stmt.execute(params![
             chunk.chunk_uid,

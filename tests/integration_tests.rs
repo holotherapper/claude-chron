@@ -10,6 +10,7 @@ use std::path::Path;
 use chrono::{TimeZone, Utc};
 use tempfile::tempdir;
 
+use claude_chron::embeddings::{EmbeddingProvider, EmbeddingResult};
 use claude_chron::search::hybrid_search;
 use claude_chron::storage::{NewSession, Storage, init_db};
 use claude_chron::transcript::{chunk_turns, parse_jsonl_lines, parse_transcript};
@@ -158,6 +159,119 @@ fn verbatim_recall_survives_transcript_deletion() {
     let recalled = storage.get_turns(&session.session_id).expect("get_turns");
     assert_eq!(recalled.len(), 1);
     assert!(recalled[0].assistant.contains("qqxylo"));
+}
+
+/// Mock provider that records how many texts each `embed_texts` call received,
+/// so tests can assert exactly how much embedding work an index run performed.
+struct CountingProvider {
+    embedded: std::cell::RefCell<Vec<usize>>,
+}
+
+impl CountingProvider {
+    fn new() -> Self {
+        Self {
+            embedded: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn total_embedded(&self) -> usize {
+        self.embedded.borrow().iter().sum()
+    }
+}
+
+impl EmbeddingProvider for CountingProvider {
+    fn embed_texts(&self, texts: &[&str]) -> EmbeddingResult<Vec<Vec<f32>>> {
+        self.embedded.borrow_mut().push(texts.len());
+        Ok(texts.iter().map(|_| vec![0.5_f32; DIM]).collect())
+    }
+}
+
+#[test]
+fn reindexing_a_grown_transcript_embeds_only_new_chunks() {
+    use claude_chron::config::Config;
+    use claude_chron::indexer::{IndexOutcome, index_session};
+    use claude_chron::transcript::session_file_from_path;
+
+    let dir = tempdir().expect("temp dir");
+    let transcript = dir
+        .path()
+        .join("11111111-2222-3333-4444-555555555555.jsonl");
+    let first_turn = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"first question about aaquartz"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"first answer about aaquartz"}}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":"second question about bbgranite"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"second answer about bbgranite"}}"#,
+        "\n",
+    );
+    std::fs::write(&transcript, first_turn).expect("write transcript");
+
+    let mut config = Config::default();
+    config.db.path = dir.path().join("memory.db");
+    config.embedding.dimension = DIM;
+    let mut storage = init_db(&config.db.path, 1000, true, DIM).expect("db init");
+
+    let provider = CountingProvider::new();
+    let session = session_file_from_path(&transcript)
+        .expect("scan should succeed")
+        .expect("session file should resolve");
+    let outcome =
+        index_session(&mut storage, &provider, &session, &config, false).expect("first index");
+    assert_eq!(outcome, IndexOutcome::Indexed);
+    let initial_chunks =
+        usize::try_from(storage.stats().expect("stats").chunk_count).expect("non-negative count");
+    assert_eq!(
+        provider.total_embedded(),
+        initial_chunks,
+        "the first index embeds every chunk"
+    );
+
+    // The session grows by one turn, as happens between two Stop hooks.
+    let appended = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"third question about ccbasalt"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"third answer about ccbasalt"}}"#,
+        "\n",
+    );
+    std::fs::write(&transcript, format!("{first_turn}{appended}")).expect("append transcript");
+
+    let session = session_file_from_path(&transcript)
+        .expect("scan should succeed")
+        .expect("session file should resolve");
+    let outcome =
+        index_session(&mut storage, &provider, &session, &config, false).expect("second index");
+    assert_eq!(outcome, IndexOutcome::Indexed);
+
+    let total_chunks =
+        usize::try_from(storage.stats().expect("stats").chunk_count).expect("non-negative count");
+    assert!(total_chunks > initial_chunks, "the new turn adds chunks");
+    assert_eq!(
+        provider.total_embedded(),
+        total_chunks,
+        "the re-index embeds only the appended chunks, not the whole transcript"
+    );
+
+    // Old and new content are both searchable after the incremental update.
+    let query_embedding = vec![0.5_f32; DIM];
+    for keyword in ["aaquartz", "ccbasalt"] {
+        let results = hybrid_search(&storage, keyword, &query_embedding, 5, None)
+            .expect("hybrid search should work");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.chunk.session_id == session.session_id),
+            "{keyword} should be findable"
+        );
+    }
+
+    // An unchanged transcript is skipped without any embedding work.
+    let embedded_before = provider.total_embedded();
+    let outcome =
+        index_session(&mut storage, &provider, &session, &config, false).expect("third index");
+    assert_eq!(outcome, IndexOutcome::Skipped);
+    assert_eq!(provider.total_embedded(), embedded_before);
 }
 
 #[test]

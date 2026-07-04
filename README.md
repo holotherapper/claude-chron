@@ -83,7 +83,9 @@ scan → parse → redact → chunk → embed → store → search (dense + spar
 6. Stores into SQLite — sqlite-vec for vectors, FTS5 trigram for keywords
 7. Searches both indexes and fuses results with Reciprocal Rank Fusion
 
-Indexing is incremental: keyed on session id, SHA-256, mtime, and an index signature (model, dimension, chunk size, redaction version). Changing any of those re-indexes the affected sessions. Each session is written in a single atomic transaction.
+Indexing is incremental at two levels. Session level: keyed on session id, SHA-256, mtime, and an index signature (model, dimension, chunk size, redaction version) — changing any of those re-indexes the affected sessions. Chunk level: when a transcript grows, only chunks whose `chunk_uid` is new are embedded; stored chunks are kept as-is, so re-indexing a long session costs only its new turns. Each session update is written in a single atomic transaction.
+
+The `Stop`/`SessionEnd` hooks take a per-session lock (`~/.claude-chron/locks/`), so overlapping hook invocations never index the same session concurrently — a second invocation exits immediately.
 
 ## CLI reference
 
@@ -110,6 +112,7 @@ Optional. Global config at `~/.claude-chron/config.toml`, project-level at `.cla
 provider = "onnx"
 model = "gpahal/bge-m3-onnx-int8"
 dimension = 1024
+intra_threads = 4  # ONNX Runtime inference threads (0 = all cores)
 
 [db]
 path = "~/.claude-chron/memory.db"

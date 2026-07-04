@@ -84,6 +84,7 @@ pub struct ChronRouter {
     dimension: usize,
     embedding_provider: String,
     embedding_model: String,
+    intra_threads: usize,
     /// Lazily-initialized, shared across the long-lived `serve` process so the
     /// ~558 MB ONNX model is loaded once instead of on every search.
     provider_cache: std::sync::Arc<std::sync::Mutex<Option<OnnxEmbeddingProvider>>>,
@@ -98,6 +99,7 @@ impl ChronRouter {
             dimension: config.embedding.dimension,
             embedding_provider: config.embedding.provider,
             embedding_model: config.embedding.model,
+            intra_threads: config.embedding.intra_threads,
             provider_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -137,6 +139,7 @@ impl ChronRouter {
             &self.embedding_provider,
             &self.embedding_model,
             self.dimension,
+            self.intra_threads,
         )
         .map_err(|e| ToolError::ExecutionError(format!("embedding: {e}")))
     }

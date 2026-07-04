@@ -45,6 +45,9 @@ pub struct EmbeddingConfig {
     pub model: String,
     /// Embedding vector dimension.
     pub dimension: usize,
+    /// Number of intra-op inference threads (0 = all cores). Kept small by
+    /// default so background indexing does not saturate the machine.
+    pub intra_threads: usize,
 }
 
 impl Default for EmbeddingConfig {
@@ -53,6 +56,7 @@ impl Default for EmbeddingConfig {
             provider: "onnx".to_string(),
             model: "gpahal/bge-m3-onnx-int8".to_string(),
             dimension: 1024,
+            intra_threads: 4,
         }
     }
 }
@@ -135,6 +139,7 @@ struct PartialEmbeddingConfig {
     provider: Option<String>,
     model: Option<String>,
     dimension: Option<usize>,
+    intra_threads: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +201,9 @@ pub fn config_from_value(value: Value) -> Result<Config, ConfigError> {
         }
         if let Some(dimension) = embedding.dimension {
             config.embedding.dimension = dimension;
+        }
+        if let Some(intra_threads) = embedding.intra_threads {
+            config.embedding.intra_threads = intra_threads;
         }
     }
 

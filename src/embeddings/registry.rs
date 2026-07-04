@@ -13,9 +13,10 @@ pub fn create_provider(
     provider: &str,
     model: &str,
     dimension: usize,
+    intra_threads: usize,
 ) -> EmbeddingResult<OnnxEmbeddingProvider> {
     match provider {
-        "onnx" => OnnxEmbeddingProvider::new(model, dimension),
+        "onnx" => OnnxEmbeddingProvider::new(model, dimension, intra_threads),
         other => Err(EmbeddingError::Provider(format!(
             "unknown embedding provider: {other}. Available: onnx"
         ))),

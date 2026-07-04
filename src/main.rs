@@ -89,7 +89,7 @@ enum Commands {
     RedactDb,
 }
 
-fn run_hook(force: bool) {
+fn run_hook() {
     let input: Value = serde_json::from_reader(std::io::stdin())
         .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
     let transcript_path = input
@@ -107,6 +107,22 @@ fn run_hook(force: bool) {
         }
     }
     let config = load_config(None).unwrap_or_default();
+
+    // Build session metadata with the same logic as a full scan (real file
+    // mtime + cwd-derived project path) so incremental skipping and
+    // project-scoped search stay consistent.
+    let Ok(Some(session)) = claude_chron::transcript::session_file_from_path(&path) else {
+        return;
+    };
+
+    // Single-flight per session: hooks fire on every turn, and indexing can
+    // outlive the gap between turns. Without this guard, overlapping hook
+    // processes each re-index the same transcript at full CPU. The lock is
+    // released automatically when the process exits, even on kill.
+    let Some(_lock) = acquire_session_lock(&config.db.path, &session.session_id) else {
+        return;
+    };
+
     let Ok(mut storage) = init_db(
         &config.db.path,
         config.db.busy_timeout_ms,
@@ -115,20 +131,28 @@ fn run_hook(force: bool) {
     ) else {
         return;
     };
-
-    // Build session metadata with the same logic as a full scan (real file
-    // mtime + cwd-derived project path) so incremental skipping and
-    // project-scoped search stay consistent.
-    if let (Ok(provider), Ok(Some(session))) = (
-        create_provider(
-            &config.embedding.provider,
-            &config.embedding.model,
-            config.embedding.dimension,
-        ),
-        claude_chron::transcript::session_file_from_path(&path),
+    if let Ok(provider) = create_provider(
+        &config.embedding.provider,
+        &config.embedding.model,
+        config.embedding.dimension,
+        config.embedding.intra_threads,
     ) {
         let _ =
-            claude_chron::indexer::index_session(&mut storage, &provider, &session, &config, force);
+            claude_chron::indexer::index_session(&mut storage, &provider, &session, &config, false);
+    }
+}
+
+/// Takes an exclusive advisory lock for a session's indexing run, returning
+/// `None` when another process already holds it. The lock file lives next to
+/// the database and stays behind; the OS drops the lock itself at process
+/// exit, so a stale file never blocks future runs.
+fn acquire_session_lock(db_path: &std::path::Path, session_id: &str) -> Option<std::fs::File> {
+    let lock_dir = db_path.parent()?.join("locks");
+    std::fs::create_dir_all(&lock_dir).ok()?;
+    let file = std::fs::File::create(lock_dir.join(format!("{session_id}.lock"))).ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(_) => None,
     }
 }
 
@@ -156,6 +180,7 @@ async fn main() -> Result<()> {
                 &config.embedding.provider,
                 &config.embedding.model,
                 config.embedding.dimension,
+                config.embedding.intra_threads,
             )
             .context("failed to initialize embedding provider")?;
             let stats = index_all(&mut storage, &provider, &config, force)
@@ -179,6 +204,7 @@ async fn main() -> Result<()> {
                 &config.embedding.provider,
                 &config.embedding.model,
                 config.embedding.dimension,
+                config.embedding.intra_threads,
             )
             .context("failed to initialize embedding provider")?;
             let query_refs = [query.as_str()];
@@ -321,6 +347,7 @@ async fn main() -> Result<()> {
                     &config.embedding.provider,
                     &config.embedding.model,
                     config.embedding.dimension,
+                    config.embedding.intra_threads,
                 ) {
                     match index_all(&mut storage, &provider, &config, false) {
                         Ok(stats) => {
@@ -345,10 +372,10 @@ async fn main() -> Result<()> {
             eprintln!("and add the printed JSON to ~/.claude/settings.json.");
         }
         Commands::HookStop => {
-            run_hook(false);
+            run_hook();
         }
         Commands::HookSessionEnd => {
-            run_hook(true);
+            run_hook();
         }
         Commands::InstallHooks => {
             let cchron_path =

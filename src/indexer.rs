@@ -1,5 +1,6 @@
 //! Indexing pipeline from JSONL transcripts into SQLite.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -11,7 +12,7 @@ use crate::config::Config;
 use crate::embeddings::{EmbeddingError, EmbeddingProvider};
 use crate::storage::{NewSession, Storage, StorageError};
 use crate::transcript::{
-    ChunkError, ParserError, REDACTION_VERSION, ScannerError, SessionFile, chunk_turns,
+    Chunk, ChunkError, ParserError, REDACTION_VERSION, ScannerError, SessionFile, chunk_turns,
     parse_transcript, scan_sessions,
 };
 
@@ -113,7 +114,12 @@ pub fn index_all(
     Ok(stats)
 }
 
-/// Indexes a single discovered session.
+/// Indexes a single discovered session incrementally: only chunks whose
+/// `chunk_uid` is not already stored are embedded, and stored chunks that no
+/// longer exist in the transcript are removed. Transcripts are append-only,
+/// so on a typical re-index (the `Stop` hook firing as a session grows) only
+/// the new turns pay the embedding cost. With `force`, every chunk is
+/// re-embedded and the session is fully replaced.
 ///
 /// # Errors
 /// Returns [`IndexError`] when parsing, embedding, or storage writes fail.
@@ -138,11 +144,6 @@ pub fn index_session(
         &config.embedding.model,
         config.chunking.max_chars,
     )?;
-    let text_refs: Vec<&str> = chunks
-        .iter()
-        .map(|chunk| chunk.text_for_embedding.as_str())
-        .collect();
-    let embeddings = embed_in_batches(provider, &text_refs, 16)?;
 
     let new_session = NewSession {
         session_id: session.session_id.clone(),
@@ -152,7 +153,44 @@ pub fn index_session(
         mtime: session.mtime,
         size: session.size,
     };
-    storage.index_session_atomic(&new_session, &signature, &turns, &chunks, &embeddings)?;
+
+    if force {
+        let text_refs: Vec<&str> = chunks
+            .iter()
+            .map(|chunk| chunk.text_for_embedding.as_str())
+            .collect();
+        let embeddings = embed_in_batches(provider, &text_refs, 16)?;
+        storage.index_session_atomic(&new_session, &signature, &turns, &chunks, &embeddings)?;
+        return Ok(IndexOutcome::Indexed);
+    }
+
+    let existing = storage.chunk_uids_for_session(&session.session_id)?;
+    let mut seen_uids = HashSet::with_capacity(chunks.len());
+    let fresh: Vec<&Chunk> = chunks
+        .iter()
+        .filter(|chunk| {
+            seen_uids.insert(chunk.chunk_uid.as_str()) && !existing.contains_key(&chunk.chunk_uid)
+        })
+        .collect();
+    let stale: Vec<i64> = existing
+        .iter()
+        .filter(|(uid, _)| !seen_uids.contains(uid.as_str()))
+        .map(|(_, id)| *id)
+        .collect();
+
+    let text_refs: Vec<&str> = fresh
+        .iter()
+        .map(|chunk| chunk.text_for_embedding.as_str())
+        .collect();
+    let embeddings = embed_in_batches(provider, &text_refs, 16)?;
+    storage.update_session_incremental(
+        &new_session,
+        &signature,
+        &turns,
+        &fresh,
+        &embeddings,
+        &stale,
+    )?;
     Ok(IndexOutcome::Indexed)
 }
 

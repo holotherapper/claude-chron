@@ -52,7 +52,11 @@ mod stub {
     impl OnnxEmbeddingProvider {
         /// # Errors
         /// Returns error when `dimension` is zero.
-        pub fn new(_model: impl Into<String>, dimension: usize) -> EmbeddingResult<Self> {
+        pub fn new(
+            _model: impl Into<String>,
+            dimension: usize,
+            _intra_threads: usize,
+        ) -> EmbeddingResult<Self> {
             if dimension == 0 {
                 return Err(super::EmbeddingError::InvalidDimension);
             }
@@ -127,11 +131,16 @@ mod real {
 
     impl OnnxEmbeddingProvider {
         /// Downloads the model from HuggingFace (if not cached) and initialises
-        /// the ONNX Runtime session.
+        /// the ONNX Runtime session. `intra_threads` bounds ONNX Runtime's
+        /// intra-op thread pool (0 = all cores).
         ///
         /// # Errors
         /// Returns [`EmbeddingError`] on dimension, download, or session errors.
-        pub fn new(model: impl Into<String>, dimension: usize) -> EmbeddingResult<Self> {
+        pub fn new(
+            model: impl Into<String>,
+            dimension: usize,
+            intra_threads: usize,
+        ) -> EmbeddingResult<Self> {
             if dimension == 0 {
                 return Err(EmbeddingError::InvalidDimension);
             }
@@ -155,7 +164,7 @@ mod real {
 
             let session = ort::session::Session::builder()
                 .map_err(|e| EmbeddingError::Provider(format!("session builder: {e}")))?
-                .with_intra_threads(0)
+                .with_intra_threads(intra_threads)
                 .map_err(|e| EmbeddingError::Provider(format!("threads: {e}")))?
                 .commit_from_file(&model_path)
                 .map_err(|e| EmbeddingError::Provider(format!("session load: {e}")))?;
@@ -359,7 +368,7 @@ mod tests {
     #[cfg(not(feature = "onnx"))]
     #[test]
     fn stub_embed_texts_should_return_one_vector_per_text() {
-        let provider = OnnxEmbeddingProvider::new("mock", 4).expect("provider should build");
+        let provider = OnnxEmbeddingProvider::new("mock", 4, 4).expect("provider should build");
         let embeddings = provider
             .embed_texts(&["hello", "world"])
             .expect("embedding should work");
@@ -374,7 +383,7 @@ mod tests {
     #[ignore = "downloads the pinned ONNX model (~558MB)"]
     fn pinned_onnx_provider_embeds_with_configured_dimension() {
         let dimension = 1024;
-        let provider = OnnxEmbeddingProvider::new("gpahal/bge-m3-onnx-int8", dimension)
+        let provider = OnnxEmbeddingProvider::new("gpahal/bge-m3-onnx-int8", dimension, 4)
             .expect("pinned model should load");
         let vectors = provider
             .embed_texts(&["hello world", "claude chron"])

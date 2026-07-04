@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- Runaway CPU from hook indexing. Three compounding causes, all fixed:
+  - Chunk-level incremental indexing: re-indexing a grown transcript now embeds only new chunks (diffed by `chunk_uid`) and removes stale ones, instead of re-embedding the entire transcript on every `Stop` hook
+  - Per-session single-flight lock (`~/.claude-chron/locks/<session_id>.lock`, advisory flock): overlapping hook invocations exit immediately instead of indexing the same session concurrently
+  - ONNX Runtime intra-op threads bounded to 4 by default (was: all cores); configurable via `embedding.intra_threads` (0 = all cores)
+- `SessionEnd` hook no longer force-re-embeds the whole session; it indexes incrementally like `Stop`
+
+### Changed
+- MSRV raised to 1.89 (std file locking)
+
 ## [0.1.0] - 2026-05-21
 
 Local RAG search over Claude Code session history. Verbatim (no LLM
